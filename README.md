@@ -826,7 +826,6 @@ Connection to YouTube:
   Packet 6 (Data)          -> AppType already YOUTUBE      -> DROP
 ```
 
-> **Honest gap:** `DROP`/`FORWARD` currently only update `connection.setAction(...)` and the `DPIStats` counters (`Forwarded`/`Dropped` in the report); **no `output.pcap` is written**. If asked "where's the filtered pcap", the honest answer is: the decision logic is fully implemented and verified (the counts change correctly with `--block-app`), but the actual `PcapWriter` that serializes forwarded packets back to disk hasn't been built yet - see [Section 12](#12-extending-the-project).
 
 ---
 
