@@ -1,42 +1,59 @@
 package com.dpi.engine;
+
 import com.dpi.pcap.*;
 import com.dpi.parser.*;
+import com.dpi.threading.RoutedPacket;
 import com.dpi.types.*;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class MultiThreadedDPIEngine {
+    private static final int NUM_LOAD_BALANCERS = 2;
+
     private PcapReader pcapReader;
     private RuleManager ruleManager;
     private Map<FiveTuple, Connection> flows;
     private DPIStats stats;
     private String inputFile;
-    private int numThreads;
+    private final int workersPerLb;
+    private final int totalWorkers;
 
-    // Thread-safe queues
-    private BlockingQueue<RawPacket> inputQueue;
-    private BlockingQueue<RawPacket>[] workerQueues;
+    private BlockingQueue<RoutedPacket>[] lbInputQueues;
+    private BlockingQueue<RoutedPacket>[] workerQueues;
+
     private ExecutorService executorService;
     private CountDownLatch workerCompletionLatch;
 
     @SuppressWarnings("unchecked")
-    public MultiThreadedDPIEngine(String inputFile, String outputFile, int numThreads) {
+    public MultiThreadedDPIEngine(String inputFile, String outputFile, int requestedWorkers) {
         this.inputFile = inputFile;
-        this.numThreads = numThreads > 0 ? numThreads : Runtime.getRuntime().availableProcessors();
         this.pcapReader = new PcapReader();
         this.ruleManager = new RuleManager();
         this.flows = new ConcurrentHashMap<>();
         this.stats = new DPIStats();
 
-        // Initialize queues
-        this.inputQueue = new LinkedBlockingQueue<>(1000);
-        this.workerQueues = new BlockingQueue[this.numThreads];
-        for (int i = 0; i < this.numThreads; i++) {
+        int workers = requestedWorkers > 0 ? requestedWorkers : Runtime.getRuntime().availableProcessors();
+        if (workers < NUM_LOAD_BALANCERS) {
+            workers = NUM_LOAD_BALANCERS;
+        }
+        if (workers % NUM_LOAD_BALANCERS != 0) {
+            workers += (NUM_LOAD_BALANCERS - (workers % NUM_LOAD_BALANCERS));
+        }
+        this.workersPerLb = workers / NUM_LOAD_BALANCERS;
+        this.totalWorkers = workers;
+
+        this.lbInputQueues = new BlockingQueue[NUM_LOAD_BALANCERS];
+        for (int i = 0; i < NUM_LOAD_BALANCERS; i++) {
+            this.lbInputQueues[i] = new LinkedBlockingQueue<>(500);
+        }
+
+        this.workerQueues = new BlockingQueue[totalWorkers];
+        for (int i = 0; i < totalWorkers; i++) {
             this.workerQueues[i] = new LinkedBlockingQueue<>(100);
         }
 
-        this.workerCompletionLatch = new CountDownLatch(this.numThreads);
-        this.executorService = Executors.newFixedThreadPool(this.numThreads + 2);
+        this.workerCompletionLatch = new CountDownLatch(totalWorkers);
+        this.executorService = Executors.newFixedThreadPool(totalWorkers + NUM_LOAD_BALANCERS);
     }
 
     public boolean process() {
@@ -46,37 +63,53 @@ public class MultiThreadedDPIEngine {
                 return false;
             }
 
-            System.out.println("Starting Multi-Threaded DPI Processing with " + numThreads + " worker threads...");
+            System.out.println("Starting Multi-Threaded DPI Processing (2-tier hierarchical): "
+                    + NUM_LOAD_BALANCERS + " load balancers x " + workersPerLb
+                    + " workers = " + totalWorkers + " total worker threads...");
 
-            // Start load balancer thread
-            executorService.submit(new LoadBalancerThread(inputQueue, workerQueues, numThreads));
-
-            // Start worker threads
-            for (int i = 0; i < numThreads; i++) {
-                executorService.submit(new FastPathThread(
-                    workerQueues[i],
-                    flows,
-                    ruleManager,
-                    stats,
-                    workerCompletionLatch
-                ));
+            for (int lb = 0; lb < NUM_LOAD_BALANCERS; lb++) {
+                BlockingQueue<RoutedPacket>[] slice = Arrays.copyOfRange(
+                        workerQueues, lb * workersPerLb, (lb + 1) * workersPerLb);
+                executorService.submit(new LoadBalancerThread(
+                        "LB-" + lb, lb, lbInputQueues[lb], slice, NUM_LOAD_BALANCERS, workersPerLb));
             }
 
-            // Reader thread - read packets and put in input queue
+            for (int w = 0; w < totalWorkers; w++) {
+                executorService.submit(new FastPathThread(
+                        "Worker-" + w, workerQueues[w], flows, ruleManager, stats, workerCompletionLatch));
+            }
+
             int packetCount = 0;
             RawPacket rawPacket = new RawPacket();
 
             while (pcapReader.readNextPacket(rawPacket)) {
-                // Clone the packet because it will be reused
+                stats.incTotalPackets();
+                stats.addTotalBytes(rawPacket.data.length);
+
                 RawPacket cloned = new RawPacket();
                 cloned.header = rawPacket.header;
                 cloned.data = rawPacket.data.clone();
 
+                ParsedPacket parsed = new ParsedPacket();
+                if (!PacketParser.parse(cloned, parsed) || !parsed.hasIP) {
+                    continue;
+                }
+
+                if (parsed.hasTCP) {
+                    stats.incTcpPackets();
+                } else if (parsed.hasUDP) {
+                    stats.incUdpPackets();
+                }
+
+                FiveTuple tuple = buildFiveTuple(parsed);
+                RoutedPacket routed = RoutedPacket.of(cloned, parsed, tuple);
+                int lbIndex = routed.hash % NUM_LOAD_BALANCERS;
+
                 try {
-                    inputQueue.put(cloned);
+                    lbInputQueues[lbIndex].put(routed);
                     packetCount++;
                     if (packetCount % 1000 == 0) {
-                        System.out.println("Queued " + packetCount + " packets, Queue size: " + inputQueue.size());
+                        System.out.println("Routed " + packetCount + " packets to load balancers");
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -86,26 +119,21 @@ public class MultiThreadedDPIEngine {
 
             pcapReader.close();
 
-            // Send sentinel values to signal end of input
-            System.out.println("All packets queued (" + packetCount + "). Waiting for processing...");
-            for (int i = 0; i < numThreads; i++) {
+            System.out.println("All packets routed (" + packetCount + "). Waiting for processing...");
+            for (int lb = 0; lb < NUM_LOAD_BALANCERS; lb++) {
                 try {
-                    RawPacket sentinel = new RawPacket();
-                    sentinel.data = new byte[0]; // Empty packet as sentinel
-                    inputQueue.put(sentinel);
+                    lbInputQueues[lb].put(RoutedPacket.sentinel());
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             }
 
-            // Wait for all workers to complete
             boolean completed = workerCompletionLatch.await(2, TimeUnit.MINUTES);
             if (!completed) {
                 System.err.println("Workers did not complete in time");
                 return false;
             }
 
-            // Shutdown executor
             executorService.shutdown();
             if (!executorService.awaitTermination(30, TimeUnit.SECONDS)) {
                 System.err.println("Executor did not terminate in time");
@@ -120,6 +148,21 @@ public class MultiThreadedDPIEngine {
             e.printStackTrace();
             return false;
         }
+    }
+
+    private FiveTuple buildFiveTuple(ParsedPacket parsed) {
+        long srcIp = parseIP(parsed.srcIp);
+        long dstIp = parseIP(parsed.destIp);
+        return new FiveTuple(srcIp, dstIp, parsed.srcPort, parsed.destPort, parsed.protocol);
+    }
+
+    private long parseIP(String ip) {
+        String[] parts = ip.split("\\.");
+        long result = 0;
+        for (int i = 0; i < 4; i++) {
+            result |= (Long.parseLong(parts[i]) << (i * 8));
+        }
+        return result;
     }
 
     private void generateReport() {
@@ -137,18 +180,18 @@ public class MultiThreadedDPIEngine {
 
         System.out.println("\n[Detected Domains/SNIs]");
         flows.values().stream()
-            .filter(c -> !c.getSni().isEmpty())
-            .map(Connection::getSni)
-            .distinct()
-            .sorted()
-            .forEach(sni -> {
-                AppType appType = flows.values().stream()
-                    .filter(c -> c.getSni().equals(sni))
-                    .findFirst()
-                    .map(Connection::getAppType)
-                    .orElse(AppType.UNKNOWN);
-                System.out.printf("  - %s -> %s%n", sni, AppType.toDisplayString(appType));
-            });
+                .filter(c -> !c.getSni().isEmpty())
+                .map(Connection::getSni)
+                .distinct()
+                .sorted()
+                .forEach(sni -> {
+                    AppType appType = flows.values().stream()
+                            .filter(c -> c.getSni().equals(sni))
+                            .findFirst()
+                            .map(Connection::getAppType)
+                            .orElse(AppType.UNKNOWN);
+                    System.out.printf("  - %s -> %s%n", sni, AppType.toDisplayString(appType));
+                });
     }
 
     private String padValue(long value) {
@@ -161,7 +204,8 @@ public class MultiThreadedDPIEngine {
 
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.out.println("Usage: java MultiThreadedDPIEngine <input.pcap> <output.pcap> [--threads N] [--block-app APP] [--block-domain DOMAIN]");
+            System.out.println(
+                    "Usage: java MultiThreadedDPIEngine <input.pcap> <output.pcap> [--threads N] [--block-app APP] [--block-domain DOMAIN]");
             System.exit(1);
         }
 
@@ -169,7 +213,6 @@ public class MultiThreadedDPIEngine {
         String outputFile = args[1];
         int numThreads = Runtime.getRuntime().availableProcessors();
 
-        // Parse command line arguments
         for (int i = 2; i < args.length; i++) {
             if (args[i].equals("--threads") && i + 1 < args.length) {
                 try {
@@ -182,17 +225,13 @@ public class MultiThreadedDPIEngine {
 
         MultiThreadedDPIEngine engine = new MultiThreadedDPIEngine(inputFile, outputFile, numThreads);
 
-        // Parse blocking rules
         for (int i = 2; i < args.length; i++) {
             if (args[i].equals("--block-app") && i + 1 < args.length) {
-                String app = args[++i];
-                engine.addBlockRule("app", app);
+                engine.addBlockRule("app", args[++i]);
             } else if (args[i].equals("--block-domain") && i + 1 < args.length) {
-                String domain = args[++i];
-                engine.addBlockRule("domain", domain);
+                engine.addBlockRule("domain", args[++i]);
             } else if (args[i].equals("--block-ip") && i + 1 < args.length) {
-                String ip = args[++i];
-                engine.addBlockRule("ip", ip);
+                engine.addBlockRule("ip", args[++i]);
             }
         }
 

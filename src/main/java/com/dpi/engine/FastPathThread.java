@@ -1,7 +1,7 @@
 package com.dpi.engine;
 
-import com.dpi.pcap.RawPacket;
-import com.dpi.parser.*;
+import com.dpi.threading.RoutedPacket;
+import com.dpi.parser.ParsedPacket;
 import com.dpi.extractor.*;
 import com.dpi.types.*;
 import java.util.Map;
@@ -9,26 +9,21 @@ import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 
-/**
- * FastPathThread processes packets assigned by the load balancer.
- * Each worker thread performs:
- * - Packet parsing
- * - Application classification
- * - Rule application
- * - Statistics tracking
- */
 public class FastPathThread implements Runnable {
-    private final BlockingQueue<RawPacket> inputQueue;
+    private final String name;
+    private final BlockingQueue<RoutedPacket> inputQueue;
     private final Map<FiveTuple, Connection> flows;
     private final RuleManager ruleManager;
     private final DPIStats stats;
     private final CountDownLatch completionLatch;
 
-    public FastPathThread(BlockingQueue<RawPacket> inputQueue,
-                         Map<FiveTuple, Connection> flows,
-                         RuleManager ruleManager,
-                         DPIStats stats,
-                         CountDownLatch completionLatch) {
+    public FastPathThread(String name,
+            BlockingQueue<RoutedPacket> inputQueue,
+            Map<FiveTuple, Connection> flows,
+            RuleManager ruleManager,
+            DPIStats stats,
+            CountDownLatch completionLatch) {
+        this.name = name;
         this.inputQueue = inputQueue;
         this.flows = flows;
         this.ruleManager = ruleManager;
@@ -38,57 +33,35 @@ public class FastPathThread implements Runnable {
 
     @Override
     public void run() {
+        Thread.currentThread().setName(name);
         try {
             while (true) {
-                RawPacket rawPacket = inputQueue.take();
+                RoutedPacket packet = inputQueue.take();
 
-                // Check for sentinel value (empty data array)
-                if (rawPacket.data.length == 0) {
+                if (packet.sentinel) {
                     break;
                 }
 
-                processPacket(rawPacket);
+                processPacket(packet);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            System.err.println("FastPathThread interrupted");
+            System.err.println(name + " interrupted");
         } finally {
             completionLatch.countDown();
         }
     }
 
-    private void processPacket(RawPacket rawPacket) {
-        stats.incTotalPackets();
-        stats.addTotalBytes(rawPacket.data.length);
+    private void processPacket(RoutedPacket packet) {
+        ParsedPacket parsed = packet.parsed;
+        FiveTuple tuple = packet.tuple;
 
-        // Parse packet
-        ParsedPacket parsed = new ParsedPacket();
-        if (!PacketParser.parse(rawPacket, parsed)) {
-            return;
-        }
-
-        // Track protocol statistics
-        if (parsed.hasTCP) {
-            stats.incTcpPackets();
-        } else if (parsed.hasUDP) {
-            stats.incUdpPackets();
-        }
-
-        // Extract five-tuple
-        FiveTuple tuple = extractFiveTuple(parsed);
-        if (tuple == null) {
-            return;
-        }
-
-        // Get or create connection
         Connection connection = flows.computeIfAbsent(tuple, t -> new Connection(t));
 
-        // Classify flow
         classifyFlow(parsed, connection);
 
-        // Apply rules
-        if (ruleManager.isBlocked(tuple.getSrcIp(), connection.getAppType(), 
-                                 connection.getSni())) {
+        if (ruleManager.isBlocked(tuple.getSrcIp(), connection.getAppType(),
+                connection.getSni())) {
             connection.setAction(PacketAction.DROP);
             stats.incDroppedPackets();
         } else {
@@ -97,19 +70,8 @@ public class FastPathThread implements Runnable {
         }
 
         connection.incPacketsIn();
-        connection.addBytesIn(rawPacket.data.length);
+        connection.addBytesIn(packet.raw.data.length);
         connection.updateLastSeen();
-    }
-
-    private FiveTuple extractFiveTuple(ParsedPacket parsed) {
-        if (!parsed.hasIP) {
-            return null;
-        }
-
-        long srcIp = parseIP(parsed.srcIp);
-        long dstIp = parseIP(parsed.destIp);
-
-        return new FiveTuple(srcIp, dstIp, parsed.srcPort, parsed.destPort, parsed.protocol);
     }
 
     private void classifyFlow(ParsedPacket parsed, Connection connection) {
@@ -139,14 +101,5 @@ public class FastPathThread implements Runnable {
                 connection.setState(ConnectionState.CLASSIFIED);
             }
         }
-    }
-
-    private long parseIP(String ip) {
-        String[] parts = ip.split("\\.");
-        long result = 0;
-        for (String part : parts) {
-            result = (result << 8) | (Long.parseLong(part) & 0xFF);
-        }
-        return result;
     }
 }

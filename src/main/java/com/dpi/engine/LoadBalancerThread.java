@@ -1,57 +1,55 @@
 package com.dpi.engine;
-import com.dpi.pcap.RawPacket;
+
+import com.dpi.threading.RoutedPacket;
 import java.util.concurrent.BlockingQueue;
 
-/**
- * LoadBalancerThread distributes incoming packets across multiple worker
- * threads
- * using a round-robin load balancing strategy.
- */
 public class LoadBalancerThread implements Runnable {
-    private final BlockingQueue<RawPacket> inputQueue;
-    private final BlockingQueue<RawPacket>[] workerQueues;
-    private final int numWorkers;
-    private int currentWorker = 0;
+    private final String name;
+    private final int lbIndex;
+    private final BlockingQueue<RoutedPacket> inputQueue;
+    private final BlockingQueue<RoutedPacket>[] ownWorkerQueues;
+    private final int numLoadBalancers;
+    private final int workersPerLb;
 
-    public LoadBalancerThread(BlockingQueue<RawPacket> inputQueue,
-            BlockingQueue<RawPacket>[] workerQueues,
-            int numWorkers) {
+    public LoadBalancerThread(String name,
+            int lbIndex,
+            BlockingQueue<RoutedPacket> inputQueue,
+            BlockingQueue<RoutedPacket>[] ownWorkerQueues,
+            int numLoadBalancers,
+            int workersPerLb) {
+        this.name = name;
+        this.lbIndex = lbIndex;
         this.inputQueue = inputQueue;
-        this.workerQueues = workerQueues;
-        this.numWorkers = numWorkers;
+        this.ownWorkerQueues = ownWorkerQueues;
+        this.numLoadBalancers = numLoadBalancers;
+        this.workersPerLb = workersPerLb;
     }
 
     @Override
     public void run() {
+        Thread.currentThread().setName(name);
         try {
-            int packetNumber = 0;
             while (true) {
-                RawPacket packet = inputQueue.take();
+                RoutedPacket packet = inputQueue.take();
 
-                // Check for sentinel value (empty data array)
-                if (packet.data.length == 0) {
-                    // Distribute sentinel to all workers to signal end
-                    for (BlockingQueue<RawPacket> queue : workerQueues) {
-                        RawPacket sentinel = new RawPacket();
-                        sentinel.data = new byte[0];
-                        queue.put(sentinel);
+                if (packet.sentinel) {
+                    for (BlockingQueue<RoutedPacket> q : ownWorkerQueues) {
+                        q.put(RoutedPacket.sentinel());
                     }
                     break;
                 }
 
-                packetNumber++;
+                int subIndex = (packet.hash / numLoadBalancers) % workersPerLb;
+                int globalWorkerIndex = lbIndex * workersPerLb + subIndex;
 
-                // Terminal log: clearly shows which worker gets the packet
-                System.out.printf("[LOAD BALANCER] Packet #%02d -> Dispatched to FastPathWorker-%d (Round-Robin)\n",
-                        packetNumber, currentWorker);
+                ownWorkerQueues[subIndex].put(packet);
 
-                // Round-robin distribution
-                workerQueues[currentWorker].put(packet);
-                currentWorker = (currentWorker + 1) % numWorkers;
+                System.out.printf("[%s] flow-hash=%d -> Worker-%d (local slot %d)%n",
+                        name, packet.hash, globalWorkerIndex, subIndex);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            System.err.println("LoadBalancerThread interrupted");
+            System.err.println(name + " interrupted");
         }
     }
 }
